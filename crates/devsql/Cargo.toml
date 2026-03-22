@@ -21,30 +21,21 @@ rusqlite.workspace = true
 git2.workspace = true
 
 # CLI framework
-clap.workspace = true
+incur = { git = "https://github.com/douglance/incurs", default-features = false, features = ["cli"] }
+async-trait = "0.1"
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
-csv.workspace = true
 
 # Date/time handling
 chrono.workspace = true
 
-# Table output
-tabled.workspace = true
-comfy-table.workspace = true
-
 # Error handling
 thiserror.workspace = true
-anyhow.workspace = true
 
 # Async
 tokio.workspace = true
-
-# Logging
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # Utilities
 dirs = "5.0"

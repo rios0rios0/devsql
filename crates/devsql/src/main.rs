@@ -1,266 +1,218 @@
 //! DevSQL CLI - Unified SQL queries across Claude/Codex + Git data
+//!
+//! Built on the incur framework, giving devsql all built-in CLI features:
+//! --help, --version, --llms, --llms-full, --mcp, --json, --csv, --table,
+//! --format, --filter-output, --verbose, shell completions, and skills.
 
-use clap::{Parser, ValueEnum};
-use devsql::{engine::detect_tables, UnifiedEngine};
 use std::path::PathBuf;
 
-#[derive(Parser)]
-#[command(name = "devsql")]
-#[command(
-    about = "Query your AI coding history to become a better prompter.\n\nJoin Claude/Codex conversations with Git commits to find your most productive prompts,\nidentify struggle sessions, and learn what actually works for you."
-)]
-#[command(version)]
-#[command(after_help = r#"WHAT YOU CAN DISCOVER:
-  • Which prompts led to the most commits
-  • When you struggle (many messages, few commits)
-  • What tools Claude uses during productive sessions
-  • Which Codex prompts in jhistory correlate with commits
-  • Patterns in your successful coding sessions
+use devsql::{engine::detect_tables, UnifiedEngine};
+use incur::cli::Cli;
+use incur::command::{CommandContext, CommandDef, CommandHandler, Example};
+use incur::output::{CommandResult, Format};
+use serde_json::Value;
 
-EXAMPLE PROMPTS FOR YOUR AI AGENT:
-  "Use devsql to find my 10 most effective prompts from the past month"
-  "Query my history to find sessions where I struggled—many prompts, few commits"
-  "Analyze what my productive days have in common using devsql"
+// ---------------------------------------------------------------------------
+// Schemas (derive macros replace manual FieldMeta construction)
+// ---------------------------------------------------------------------------
 
-Learn more: https://github.com/douglance/devsql"#)]
-struct Cli {
+#[derive(incur::Args, serde::Deserialize)]
+#[allow(dead_code)]
+struct QueryArgs {
     /// SQL query to execute
-    query: Option<String>,
+    query: String,
+}
 
-    /// Git repository path (defaults to current directory)
-    #[arg(short = 'r', long = "repo", default_value = ".")]
-    repo: PathBuf,
-
+#[derive(incur::Options, serde::Deserialize)]
+#[allow(dead_code)]
+struct QueryOptions {
+    /// Git repository path
+    #[incur(alias = "r", default = ".")]
+    repo: String,
     /// Claude data directory (defaults to ~/.claude)
-    #[arg(short = 'd', long = "data-dir")]
-    data_dir: Option<PathBuf>,
-
-    /// Output format
-    #[arg(short = 'f', long = "format", default_value = "table")]
-    format: OutputFormat,
-
-    /// Omit header row
-    #[arg(short = 'H', long = "no-header")]
+    #[incur(alias = "d")]
+    data_dir: Option<String>,
+    /// Omit header row in table/csv output
+    #[incur(alias = "H")]
     no_header: bool,
 }
 
-#[derive(Clone, ValueEnum)]
-enum OutputFormat {
-    Table,
-    Json,
-    Jsonl,
-    Csv,
-}
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+struct SqlHandler;
 
-    // Handle no query - show help
-    let query = match cli.query {
-        Some(q) => q,
-        None => {
-            print_help();
-            return Ok(());
-        }
-    };
-
-    // Resolve paths
-    let claude_dir = cli
-        .data_dir
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".claude"));
-
-    let repo_path = if cli.repo == PathBuf::from(".") {
-        std::env::current_dir()?
-    } else {
-        cli.repo.clone()
-    };
-
-    // Create engine and load tables
-    let mut engine = UnifiedEngine::new(claude_dir, repo_path)?;
-
-    // Detect which tables are needed
-    let (claude_tables, git_tables) = detect_tables(&query);
-
-    // Load only needed tables
-    let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
-    let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
-
-    engine.load_claude_tables(&claude_refs)?;
-    engine.load_git_tables(&git_refs)?;
-
-    // Execute query
-    let results = engine.query(&query)?;
-
-    // Format output
-    match cli.format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&results)?);
-        }
-        OutputFormat::Jsonl => {
-            for row in &results {
-                println!("{}", serde_json::to_string(row)?);
+#[async_trait::async_trait]
+impl CommandHandler for SqlHandler {
+    async fn run(&self, ctx: CommandContext) -> CommandResult {
+        let query = match ctx.args.get("query").and_then(|v| v.as_str()) {
+            Some(q) if !q.is_empty() => q.to_string(),
+            _ => {
+                return CommandResult::Error {
+                    code: "MISSING_QUERY".to_string(),
+                    message: "No SQL query provided. Run `devsql --help` for usage examples."
+                        .to_string(),
+                    retryable: false,
+                    exit_code: Some(1),
+                    cta: None,
+                };
             }
-        }
-        OutputFormat::Csv => {
-            if results.is_empty() {
-                return Ok(());
-            }
-            let headers: Vec<&str> = results[0]
-                .as_object()
-                .map(|o| o.keys().map(|k| k.as_str()).collect())
-                .unwrap_or_default();
+        };
 
-            if !cli.no_header {
-                println!("{}", headers.join(","));
-            }
-            for row in &results {
-                if let Some(obj) = row.as_object() {
-                    let values: Vec<String> = headers
-                        .iter()
-                        .map(|h| {
-                            obj.get(*h)
-                                .map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    println!("{}", values.join(","));
+        let repo_str = ctx
+            .options
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        let repo_path = if repo_str == "." {
+            match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    return CommandResult::Error {
+                        code: "PATH_ERROR".to_string(),
+                        message: format!("Cannot determine current directory: {e}"),
+                        retryable: false,
+                        exit_code: Some(1),
+                        cta: None,
+                    };
                 }
             }
+        } else {
+            PathBuf::from(repo_str)
+        };
+
+        let claude_dir = match ctx.options.get("data_dir").and_then(|v| v.as_str()) {
+            Some(d) => PathBuf::from(d),
+            None => dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".claude"),
+        };
+
+        let mut engine = match UnifiedEngine::new(claude_dir, repo_path) {
+            Ok(e) => e,
+            Err(e) => {
+                return CommandResult::Error {
+                    code: "ENGINE_ERROR".to_string(),
+                    message: format!("Failed to create engine: {e}"),
+                    retryable: false,
+                    exit_code: Some(1),
+                    cta: None,
+                };
+            }
+        };
+
+        let (claude_tables, git_tables) = detect_tables(&query);
+        let claude_refs: Vec<&str> = claude_tables.iter().map(|s| s.as_str()).collect();
+        let git_refs: Vec<&str> = git_tables.iter().map(|s| s.as_str()).collect();
+
+        if let Err(e) = engine.load_claude_tables(&claude_refs) {
+            return CommandResult::Error {
+                code: "LOAD_ERROR".to_string(),
+                message: format!("Failed to load Claude tables: {e}"),
+                retryable: false,
+                exit_code: Some(1),
+                cta: None,
+            };
         }
-        OutputFormat::Table => {
-            print_table(&results, !cli.no_header);
+        if let Err(e) = engine.load_git_tables(&git_refs) {
+            return CommandResult::Error {
+                code: "LOAD_ERROR".to_string(),
+                message: format!("Failed to load Git tables: {e}"),
+                retryable: false,
+                exit_code: Some(1),
+                cta: None,
+            };
         }
-    }
 
-    Ok(())
-}
-
-fn print_table(results: &[serde_json::Value], show_header: bool) {
-    if results.is_empty() {
-        println!("No results");
-        return;
-    }
-
-    let headers: Vec<String> = results[0]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-
-    // Calculate column widths
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-
-    for row in results {
-        if let Some(obj) = row.as_object() {
-            for (i, h) in headers.iter().enumerate() {
-                let val_len = obj
-                    .get(h)
-                    .map(|v| match v {
-                        serde_json::Value::String(s) => s.len(),
-                        other => other.to_string().len(),
-                    })
-                    .unwrap_or(0);
-                widths[i] = widths[i].max(val_len).min(50);
+        #[cfg(feature = "tree-sitter-ast")]
+        {
+            let code_tables = detect_tables(&query).2;
+            let code_refs: Vec<&str> = code_tables.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = engine.load_code_tables(&code_refs) {
+                return CommandResult::Error {
+                    code: "LOAD_ERROR".to_string(),
+                    message: format!("Failed to load code tables: {e}"),
+                    retryable: false,
+                    exit_code: Some(1),
+                    cta: None,
+                };
             }
         }
-    }
 
-    // Print header
-    if show_header {
-        let header_line: Vec<String> = headers
-            .iter()
-            .enumerate()
-            .map(|(i, h)| format!("{:width$}", h, width = widths[i]))
-            .collect();
-        println!("{}", header_line.join(" | "));
-
-        let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-        println!("{}", separator.join("-+-"));
-    }
-
-    // Print rows
-    for row in results {
-        if let Some(obj) = row.as_object() {
-            let values: Vec<String> = headers
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    let val = obj
-                        .get(h)
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Null => String::new(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_default();
-                    let truncated = if val.len() > widths[i] {
-                        format!("{}...", &val[..widths[i].saturating_sub(3)])
-                    } else {
-                        val
-                    };
-                    format!("{:width$}", truncated, width = widths[i])
-                })
-                .collect();
-            println!("{}", values.join(" | "));
+        match engine.query(&query) {
+            Ok(results) => CommandResult::Ok {
+                data: Value::Array(results),
+                cta: None,
+            },
+            Err(e) => CommandResult::Error {
+                code: "QUERY_ERROR".to_string(),
+                message: format!("Query failed: {e}"),
+                retryable: false,
+                exit_code: Some(1),
+                cta: None,
+            },
         }
     }
 }
 
-fn print_help() {
-    println!(
-        r#"devsql - Query your AI coding history to become a better prompter
+// ---------------------------------------------------------------------------
+// CLI construction
+// ---------------------------------------------------------------------------
 
-Join Claude/Codex conversations with Git commits to find your most productive
-prompts, identify struggle sessions, and learn what actually works for you.
+fn build_cli() -> Cli {
+    Cli::create("devsql")
+        .description(
+            "Query your AI coding history to become a better prompter.\n\n\
+             Join Claude/Codex conversations with Git commits to find your most productive\n\
+             prompts, identify struggle sessions, and learn what actually works for you.",
+        )
+        .version("0.1.2")
+        .format(Format::Table)
+        .root(
+            CommandDef::build("devsql", SqlHandler)
+                .description("Execute a SQL query against your Claude/Codex + Git data")
+                .args::<QueryArgs>()
+                .options::<QueryOptions>()
+                .examples(vec![
+                    Example {
+                        command: r#""SELECT * FROM commits LIMIT 5""#.to_string(),
+                        description: Some("List recent commits".to_string()),
+                    },
+                    Example {
+                        command: r#""SELECT h.message, COUNT(c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY h.message HAVING commits > 0 ORDER BY commits DESC LIMIT 10""#.to_string(),
+                        description: Some("Most productive prompts".to_string()),
+                    },
+                    Example {
+                        command: r#""SELECT DATE(h.timestamp) as day, COUNT(*) as prompts, COUNT(DISTINCT c.id) as commits FROM history h LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at) GROUP BY day ORDER BY prompts DESC LIMIT 10""#.to_string(),
+                        description: Some("Struggle days".to_string()),
+                    },
+                    Example {
+                        command: r#""SELECT datetime(timestamp/1000, 'unixepoch') as time, display FROM jhistory ORDER BY timestamp DESC LIMIT 10""#.to_string(),
+                        description: Some("Recent Codex prompts".to_string()),
+                    },
+                ])
+                .hint(
+                    "TABLES:\n  \
+                     Claude Code:  history (prompts), transcripts (conversations), todos\n  \
+                     Codex CLI:    jhistory / codex_history (session_id, ts, text, display, timestamp)\n  \
+                     Git:          commits, diffs, diff_files, branches\n\n\
+                     TELL YOUR AI AGENT:\n  \
+                     \"Use devsql to find my most effective prompts from the past month\"\n  \
+                     \"Query my history to find when I struggled most\"\n  \
+                     \"Analyze what my productive days have in common using devsql\"\n\n\
+                     Learn more: https://github.com/douglance/devsql",
+                )
+                .done(),
+        )
+}
 
-USAGE:
-  devsql [OPTIONS] "SQL QUERY"
-
-WHAT YOU CAN DISCOVER:
-  • Which prompts led to the most commits
-  • When you struggle (many messages, few commits)
-  • What tools Claude uses during productive sessions
-  • Patterns in your successful coding sessions
-
-TABLES:
-  Claude Code:  history (prompts), transcripts (conversations), todos
-  Codex CLI:    jhistory / codex_history (session_id, ts, text, display, timestamp)
-  Git:          commits, diffs, diff_files, branches
-
-EXAMPLES:
-
-  Find your most productive prompts:
-  devsql "SELECT h.message, COUNT(c.id) as commits
-    FROM history h
-    LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-    GROUP BY h.message HAVING commits > 0
-    ORDER BY commits DESC LIMIT 10"
-
-  Identify struggle days (many prompts, few commits):
-  devsql "SELECT DATE(h.timestamp) as day,
-    COUNT(*) as prompts, COUNT(DISTINCT c.id) as commits
-    FROM history h
-    LEFT JOIN commits c ON DATE(h.timestamp) = DATE(c.authored_at)
-    GROUP BY day ORDER BY prompts DESC LIMIT 10"
-
-  Recent Codex prompts:
-  devsql "SELECT datetime(timestamp/1000, 'unixepoch') as time, display
-    FROM jhistory ORDER BY timestamp DESC LIMIT 10"
-
-OPTIONS:
-  -r, --repo PATH       Git repository (default: current directory)
-  -d, --data-dir PATH   Claude data (default: ~/.claude)
-  CODEX_HOME            Codex data directory for jhistory (default: ~/.codex)
-  -f, --format FORMAT   Output: table, json, jsonl, csv
-  -h, --help            Show full help with more examples
-
-TELL YOUR AI AGENT:
-  "Use devsql to find my most effective prompts from the past month"
-  "Query my history to find when I struggled most"
-
-Learn more: https://github.com/douglance/devsql
-"#
-    );
+#[tokio::main]
+async fn main() {
+    let cli = build_cli();
+    if let Err(e) = cli.serve().await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 }
